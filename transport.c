@@ -31,6 +31,11 @@ typedef struct
     int connection_state;   /* state of the connection (established, etc.) */
     tcp_seq initial_sequence_num;
 
+    tcp_seq rcvd_seq;
+    tcp_seq rcvd_ack;
+    tcp_seq rcvd_win;
+    tcp_seq rcvd_len;
+
     /* any other connection-wide global variables go here */
 } context_t;
 
@@ -59,9 +64,143 @@ void transport_init(mysocket_t sd, bool_t is_active)
      * if connection fails; to do so, just set errno appropriately (e.g. to
      * ECONNREFUSED, etc.) before calling the function.
      */
-    ctx->connection_state = ESTABLISHED;
-    stcp_unblock_application(sd);
 
+    ctx->connection_state = LISTEN;
+
+    // Client active open
+    if (is_active == TRUE) {
+        //create SYN packet
+        STCPHeader *header = (STCPHeader *) calloc(1, sizeof(STCPHeader));
+        header->th_seq = htonl(ctx->initial_sequence_num);
+        header->th_ack = htonl(0);
+        header->th_off = sizeof(STCPHeader)/4;
+        header->th_flags = TH_SYN;
+        header->th_win = htons(3072);
+
+        //send SYN packet to server
+        if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+            errno = ECONNREFUSED;
+            free(header);
+            free(ctx);
+            return;
+        }
+        ctx->connection_state = SYN_SENT;
+
+        //wait for SYN-ACK packet from server
+        stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+        printf("wait for SYN-ACK packet from server\n");
+
+        STCPHeader *packet = (STCPHeader *) calloc(1, sizeof(STCPHeader) + STCP_MSS);
+        ssize_t numBytes;
+        if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < sizeof(STCPHeader)) {
+            errno = ECONNREFUSED;
+            free(header);
+            free(packet);
+            free(ctx);
+            return;
+        }
+        if (packet->th_flags != (TH_SYN | TH_ACK)) {
+            errno = ECONNREFUSED;
+            free(header);
+            free(packet);
+            free(ctx);
+            return;
+        }
+        ctx->rcvd_seq = ntohl(packet->th_seq);
+        ctx->rcvd_ack = ntohl(packet->th_ack);
+        ctx->rcvd_win = ntohs(packet->th_win);
+        ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+        ctx->connection_state = ESTABLISHED;
+
+        //create ACK packet
+        header->th_seq = htonl(ctx->rcvd_ack);
+        header->th_ack = htonl(ctx->rcvd_seq + 1);
+        header->th_flags = TH_ACK;
+        header->th_off = sizeof(STCPHeader)/4;
+        header->th_win = htons(3072);
+
+        //send ACK packet to server
+        if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+            errno = ECONNREFUSED;
+            free(header);
+            free(packet);
+            free(ctx);
+            return;
+        }
+        free(header);
+        free(packet);
+    }
+    // Server passive open
+    else {
+        //wait for SYN packet from client
+        stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+
+        STCPHeader *packet = (STCPHeader *)calloc(1, sizeof(STCPHeader) + STCP_MSS);
+        ssize_t numBytes;
+        if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+            errno = ECONNREFUSED;
+            free(packet);
+            free(ctx);
+            return;
+        }
+        if (packet->th_flags != TH_SYN) {
+            errno = ECONNREFUSED;
+            free(packet);
+            free(ctx);
+            return;
+        }
+        ctx->rcvd_seq = ntohl(packet->th_seq);
+        ctx->rcvd_ack = ntohl(packet->th_ack);
+        ctx->rcvd_win = ntohs(packet->th_win);
+        ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+        //create SYN-ACK packet
+        STCPHeader *header = (STCPHeader *) calloc(1, sizeof(STCPHeader));
+        header->th_seq = htonl(ctx->rcvd_ack);
+        header->th_ack = htonl(ctx->rcvd_seq + 1);
+        header->th_flags = TH_SYN | TH_ACK;
+        header->th_off = sizeof(STCPHeader)/4;
+        header->th_win = htons(3072);
+
+        //new socket sends SYN-ACK packet to client
+        if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+            errno = ECONNREFUSED;
+            free(header);
+            free(packet);
+            free(ctx);
+            return;
+        }
+
+        //wait for ACK packet from client
+        stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+
+        if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+            errno = ECONNREFUSED;
+            free(header);
+            free(packet);
+            free(ctx);
+            return;
+        }
+        if (packet->th_flags != TH_ACK) {
+            errno = ECONNREFUSED;
+            free(header);
+            free(packet);
+            free(ctx);
+            return;
+        }
+        ctx->rcvd_seq = ntohl(packet->th_seq);
+        ctx->rcvd_ack = ntohl(packet->th_ack);
+        ctx->rcvd_win = ntohs(packet->th_win);
+        ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+        ctx->connection_state = ESTABLISHED;
+
+        free(header);
+        free(packet);
+    }
+
+    stcp_unblock_application(sd);
     control_loop(sd, ctx);
 
     /* do any cleanup here */
