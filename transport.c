@@ -20,7 +20,9 @@
 #include "transport.h"
 
 
-enum { CLOSED, LISTEN, SYN_RCVD, SYN_SENT, ESTABLISHED };    /* obviously you should have more states */
+enum { LISTEN, SYN_RCVD, SYN_SENT, ESTABLISHED,
+    FIN_WAIT_1, FIN_WAIT_2, TIME_WAIT, CLOSED,
+    CLOSE_WAIT, LAST_ACK, CLOSING };    /* obviously you should have more states */
 
 
 /* this structure is global to a mysocket descriptor */
@@ -88,7 +90,6 @@ void transport_init(mysocket_t sd, bool_t is_active)
 
         //wait for SYN-ACK packet from server
         stcp_wait_for_event(sd, NETWORK_DATA, NULL);
-        printf("wait for SYN-ACK packet from server\n");
 
         STCPHeader *packet = (STCPHeader *) calloc(1, sizeof(STCPHeader) + STCP_MSS);
         ssize_t numBytes;
@@ -154,6 +155,8 @@ void transport_init(mysocket_t sd, bool_t is_active)
         ctx->rcvd_ack = ntohl(packet->th_ack);
         ctx->rcvd_win = ntohs(packet->th_win);
         ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+        ctx->connection_state = SYN_RCVD;
 
         //create SYN-ACK packet
         STCPHeader *header = (STCPHeader *) calloc(1, sizeof(STCPHeader));
@@ -233,7 +236,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
 
         /* see stcp_api.h or stcp_api.c for details of this function */
         /* XXX: you will need to change some of these arguments! */
-        event = stcp_wait_for_event(sd, 0, NULL);
+        event = stcp_wait_for_event(sd, ANY_EVENT, NULL);
 
         /* check whether it was the network, app, or a close request */
         if (event & APP_DATA)
@@ -241,6 +244,202 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             /* the application has requested that data be sent */
             /* see stcp_app_recv() */
         }
+        else if (event & NETWORK_DATA)
+        {
+            //wait for data
+            STCPHeader *packet = (STCPHeader *)calloc(1, sizeof(STCPHeader) + STCP_MSS);
+            ssize_t numBytes;
+            if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+                errno = ECONNREFUSED;
+                free(packet);
+                free(ctx);
+                return;
+            }
+            ctx->rcvd_seq = ntohl(packet->th_seq);
+            ctx->rcvd_ack = ntohl(packet->th_ack);
+            ctx->rcvd_win = ntohs(packet->th_win);
+            ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+            //check if connection is ESTABLISHED
+            if(ctx->connection_state != ESTABLISHED) {
+                errno = ECONNREFUSED;
+                free(packet);
+                free(ctx);
+                return;
+            }
+            
+            //check if packet is FIN-ACK
+            if(packet->th_flags == (TH_FIN | TH_ACK)) {
+                ctx->connection_state = CLOSE_WAIT;
+
+                //notifiy FIN-ACK received
+                stcp_fin_received(sd);
+
+                //create ACK packet
+                STCPHeader *header = (STCPHeader *) calloc(1, sizeof(STCPHeader));
+                header->th_seq = htonl(ctx->rcvd_ack);
+                header->th_ack = htonl(ctx->rcvd_seq + 1);
+                header->th_flags = TH_ACK;
+                header->th_off = sizeof(STCPHeader)/4;
+                header->th_win = htons(3072);
+
+                //send ACK packet to server
+                if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
+                ctx->connection_state = LAST_ACK;
+
+                //wait for ACK packet from client
+                stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+
+                if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
+                if (packet->th_flags != TH_ACK) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
+                ctx->rcvd_seq = ntohl(packet->th_seq);
+                ctx->rcvd_ack = ntohl(packet->th_ack);
+                ctx->rcvd_win = ntohs(packet->th_win);
+                ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+                ctx->connection_state = CLOSED;
+                ctx->done = TRUE;
+
+                free(header);
+                free(packet);
+                free(ctx);
+                return;
+            }
+            //regular data packet
+            else {
+                
+            }
+        }
+        /* the application has requested to close the connection */
+        else if (event & APP_CLOSE_REQUESTED)
+        {
+            //check if connection is ESTABLISHED
+            if(ctx->connection_state != ESTABLISHED) {
+                errno = ECONNREFUSED;
+                free(ctx);
+                return;
+            }
+
+            //create FIN-ACK packet
+            STCPHeader *header = (STCPHeader *) calloc(1, sizeof(STCPHeader));
+            header->th_seq = htonl(ctx->rcvd_ack);
+            header->th_ack = htonl(ctx->rcvd_seq + 1);
+            header->th_flags = TH_FIN | TH_ACK;
+            header->th_off = sizeof(STCPHeader)/4;
+            header->th_win = htons(3072);
+
+            //send FINACK packet to server
+            if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+                errno = ECONNREFUSED;
+                free(header);
+                free(ctx);
+                return;
+            }
+
+            ctx->connection_state = FIN_WAIT_1;
+
+            //wait for ACK packet from server
+            stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+
+            STCPHeader *packet = (STCPHeader *)calloc(1, sizeof(STCPHeader) + STCP_MSS);
+            ssize_t numBytes;
+            if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+                errno = ECONNREFUSED;
+                free(header);
+                free(packet);
+                free(ctx);
+                return;
+            }
+            if (packet->th_flags != TH_ACK) {
+                errno = ECONNREFUSED;
+                free(header);
+                free(packet);
+                free(ctx);
+                return;
+            }
+            ctx->rcvd_seq = ntohl(packet->th_seq);
+            ctx->rcvd_ack = ntohl(packet->th_ack);
+            ctx->rcvd_win = ntohs(packet->th_win);
+            ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+            ctx->connection_state = FIN_WAIT_2;
+
+            //wait for FIN-ACK packet from server
+            stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+
+            if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+                errno = ECONNREFUSED;
+                free(header);
+                free(packet);
+                free(ctx);
+                return;
+            }
+            if (packet->th_flags != (TH_FIN | TH_ACK)) {
+                errno = ECONNREFUSED;
+                free(header);
+                free(packet);
+                free(ctx);
+                return;
+            }
+            ctx->rcvd_seq = ntohl(packet->th_seq);
+            ctx->rcvd_ack = ntohl(packet->th_ack);
+            ctx->rcvd_win = ntohs(packet->th_win);
+            ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+            ctx->connection_state = TIME_WAIT;
+
+            //create ACK packet
+            header->th_seq = htonl(ctx->rcvd_ack);
+            header->th_ack = htonl(ctx->rcvd_seq + 1);
+            header->th_flags = TH_ACK;
+            header->th_off = sizeof(STCPHeader)/4;
+            header->th_win = htons(3072);
+
+            //send ACK packet to server
+            if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+                errno = ECONNREFUSED;
+                free(header);
+                free(packet);
+                free(ctx);
+                return;
+            }
+
+            ctx->connection_state = CLOSED;
+            ctx->done = TRUE;
+
+            free(header);
+            free(packet);
+            free(ctx);
+            return;
+        }
+        else if (event & TIMEOUT)
+        {
+            /* nothing to do */
+            assert(0);
+        }
+        else
+        {
+            /* this should never happen */
+            assert(0);
+        }            
 
         /* etc. */
     }
