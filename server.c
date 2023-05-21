@@ -111,6 +111,7 @@ main(int argc, char *argv[])
         fprintf(stderr, "connected to %s at port %u\n",
                 inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
 
+        printf("accepted connection\n");
         do_connection(sd);
     }                           /* end for(;;) */
 
@@ -134,6 +135,7 @@ static void do_connection(mysocket_t sd)
     for (;;)
     {
         rc = get_nvt_line(sd, line);
+        printf("line = %s\n", line);
         if (rc < 0 || !*line)
             goto done;
         fprintf(stderr, "client: %s\n", line);

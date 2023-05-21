@@ -176,6 +176,7 @@ loop_until_end(int sd)
             errcnd = 1;
             break;
         }
+        printf("client: %s", line);
 
         if (get_nvt_line(sd, line) < 0)
         {
