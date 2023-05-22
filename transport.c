@@ -483,7 +483,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 stcp_fin_received(sd);
 
                 //create ACK packet
-                header->th_seq = htonl(ctx->rcvd_ack);
+                header->th_seq = htonl(ctx->rcvd_ack + 1);
                 header->th_ack = htonl(ctx->rcvd_seq + 1);
                 header->th_flags = TH_ACK;
                 header->th_off = sizeof(STCPHeader)/4;
