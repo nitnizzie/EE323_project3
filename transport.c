@@ -256,7 +256,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 free(ctx);
                 return;
             }
-            printf("payload: %ssize: %d\n", payload, payload_size);
+            // printf("payload: %ssize: %d\n", payload, payload_size);
 
             //create ACK packet
             STCPHeader *packet = (STCPHeader *)calloc(1, sizeof(STCPHeader) + payload_size);
@@ -266,7 +266,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             packet->th_off = sizeof(STCPHeader)/4;
             packet->th_win = htons(3072);
 
-            memcpy(packet + sizeof(STCPHeader), payload, payload_size);
+            memcpy((void*)packet + sizeof(STCPHeader), payload, payload_size);
 
             //send packet to peer
             if(stcp_network_send(sd, (void *)packet, sizeof(STCPHeader) + payload_size, NULL) < 0) {
@@ -280,7 +280,11 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             //wait for ACK packet from peer
             stcp_wait_for_event(sd, NETWORK_DATA, NULL);
 
-            if(stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS) < (ssize_t)sizeof(STCPHeader)) {
+            char *buffer = (char *)calloc(1, sizeof(STCPHeader) + STCP_MSS);
+            packet = (STCPHeader *)buffer;
+
+            ssize_t numBytes;
+            if((numBytes = stcp_network_recv(sd, (void *)buffer, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
                 errno = ECONNREFUSED;
                 free(payload);
                 free(packet);
@@ -290,7 +294,14 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             ctx->rcvd_seq = ntohl(packet->th_seq);
             ctx->rcvd_ack = ntohl(packet->th_ack);
             ctx->rcvd_win = ntohs(packet->th_win);
-            ctx->rcvd_len = payload_size;
+            ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+            // char * rcvd_payload = (char *)calloc(1, ctx->rcvd_len);
+            // memcpy(rcvd_payload, buffer + sizeof(STCPHeader), ctx->rcvd_len);
+            // payload[ctx->rcvd_len] = '\0';
+
+            // printf("rcvd: %d\t%d\t%ld\t%d\n", ctx->rcvd_seq, ctx->rcvd_ack, ctx->rcvd_len, ctx->rcvd_win);
+            // printf("rcvd_payload: %s\n", rcvd_payload); 
 
             free(payload);
             free(packet);
@@ -298,9 +309,10 @@ static void control_loop(mysocket_t sd, context_t *ctx)
         else if (event & NETWORK_DATA)
         {
             //wait for data from peer
-            STCPHeader *packet = (STCPHeader *)calloc(1, sizeof(STCPHeader) + STCP_MSS);
+            char *buffer = (char *)calloc(1, sizeof(STCPHeader) + STCP_MSS);
+            STCPHeader *packet = (STCPHeader *)buffer;
             ssize_t numBytes;
-            if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+            if((numBytes = stcp_network_recv(sd, (void *)buffer , sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
                 errno = ECONNREFUSED;
                 free(packet);
                 free(ctx);
@@ -310,8 +322,13 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             ctx->rcvd_ack = ntohl(packet->th_ack);
             ctx->rcvd_win = ntohs(packet->th_win);
             ctx->rcvd_len = numBytes - sizeof(STCPHeader);
-            printf("%d\n", ctx->rcvd_len);
-            printf("%s\n", (char*)packet + sizeof(STCPHeader));
+
+            // char* payload = (char *)calloc(1, STCP_MSS);
+            // memcpy(payload, buffer + sizeof(STCPHeader), ctx->rcvd_len);
+            // payload[ctx->rcvd_len] = '\0';
+
+            // printf("rcvd: %d\t%d\t%ld\t%d\n", ctx->rcvd_seq, ctx->rcvd_ack, ctx->rcvd_len, ctx->rcvd_win);
+            // printf("payload: %ssize: %d\n", payload, ctx->rcvd_len);
 
             //check if connection is ESTABLISHED
             if(ctx->connection_state != ESTABLISHED) {
@@ -336,7 +353,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 header->th_off = sizeof(STCPHeader)/4;
                 header->th_win = htons(3072);
 
-                //send ACK packet to server
+                //send ACK packet to client
                 if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
                     errno = ECONNREFUSED;
                     free(header);
@@ -345,6 +362,22 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                     return;
                 }
                 ctx->connection_state = LAST_ACK;
+
+                //create FIN-ACK packet
+                header->th_seq = htonl(ctx->rcvd_ack + 1);
+                header->th_ack = htonl(ctx->rcvd_seq + 1);
+                header->th_flags = TH_FIN | TH_ACK;
+                header->th_off = sizeof(STCPHeader)/4;
+                header->th_win = htons(3072);
+
+                //send FIN-ACK packet to client 
+                if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
 
                 //wait for ACK packet from client
                 stcp_wait_for_event(sd, NETWORK_DATA, NULL);
@@ -373,7 +406,6 @@ static void control_loop(mysocket_t sd, context_t *ctx)
 
                 free(header);
                 free(packet);
-                free(ctx);
                 return;
             }
             //regular data packet
@@ -412,12 +444,12 @@ static void control_loop(mysocket_t sd, context_t *ctx)
             //create FIN-ACK packet
             STCPHeader *header = (STCPHeader *) calloc(1, sizeof(STCPHeader));
             header->th_seq = htonl(ctx->rcvd_ack);
-            header->th_ack = htonl(ctx->rcvd_seq + 1);
+            header->th_ack = htonl(ctx->rcvd_seq + ctx->rcvd_len);
             header->th_flags = TH_FIN | TH_ACK;
             header->th_off = sizeof(STCPHeader)/4;
             header->th_win = htons(3072);
 
-            //send FINACK packet to server
+            //send FIN-ACK packet to server
             if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
                 errno = ECONNREFUSED;
                 free(header);
@@ -501,7 +533,6 @@ static void control_loop(mysocket_t sd, context_t *ctx)
 
             free(header);
             free(packet);
-            free(ctx);
             return;
         }
         else

@@ -116,6 +116,7 @@ main(int argc, char *argv[])
 
     loop_until_end(sd);
 
+    printf("client close\n");
     if (myclose(sd) < 0)
     {
         perror("myclose");
