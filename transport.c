@@ -129,7 +129,6 @@ void transport_init(mysocket_t sd, bool_t is_active)
             free(ctx);
             return;
         }
-        ctx->rcvd_ack += 1;
         ctx->rcvd_seq += 1;
 
         free(header);
@@ -163,7 +162,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
 
         //create SYN-ACK packet
         STCPHeader *header = (STCPHeader *) calloc(1, sizeof(STCPHeader));
-        header->th_seq = htonl(ctx->rcvd_ack);
+        header->th_seq = htonl(ctx->initial_sequence_num);
         header->th_ack = htonl(ctx->rcvd_seq + 1);
         header->th_flags = TH_SYN | TH_ACK;
         header->th_off = sizeof(STCPHeader)/4;
@@ -364,7 +363,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 ctx->connection_state = LAST_ACK;
 
                 //create FIN-ACK packet
-                header->th_seq = htonl(ctx->rcvd_ack + 1);
+                header->th_seq = htonl(ctx->rcvd_ack);
                 header->th_ack = htonl(ctx->rcvd_seq + 1);
                 header->th_flags = TH_FIN | TH_ACK;
                 header->th_off = sizeof(STCPHeader)/4;
@@ -471,56 +470,106 @@ static void control_loop(mysocket_t sd, context_t *ctx)
                 free(ctx);
                 return;
             }
-            if (packet->th_flags != TH_ACK) {
-                errno = ECONNREFUSED;
-                free(header);
-                free(packet);
-                free(ctx);
-                return;
-            }
             ctx->rcvd_seq = ntohl(packet->th_seq);
             ctx->rcvd_ack = ntohl(packet->th_ack);
             ctx->rcvd_win = ntohs(packet->th_win);
             ctx->rcvd_len = numBytes - sizeof(STCPHeader);
 
-            ctx->connection_state = FIN_WAIT_2;
+            //simultaneous close
+            if(packet->th_flags == (TH_FIN | TH_ACK)) {
+                ctx->connection_state = CLOSING;
 
-            //wait for FIN-ACK packet from server
-            stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+                //notifiy FIN-ACK received
+                stcp_fin_received(sd);
 
-            if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
-                errno = ECONNREFUSED;
-                free(header);
-                free(packet);
-                free(ctx);
-                return;
+                //create ACK packet
+                header->th_seq = htonl(ctx->rcvd_ack);
+                header->th_ack = htonl(ctx->rcvd_seq + 1);
+                header->th_flags = TH_ACK;
+                header->th_off = sizeof(STCPHeader)/4;
+                header->th_win = htons(3072);
+
+                //send ACK packet to server
+                if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
+
+                ctx->connection_state = TIME_WAIT;
+
+                //wait for ACK packet from server
+                stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+
+                if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
+                if (packet->th_flags != TH_ACK) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
+                ctx->rcvd_seq = ntohl(packet->th_seq);
+                ctx->rcvd_ack = ntohl(packet->th_ack);
+                ctx->rcvd_win = ntohs(packet->th_win);
+                ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+                
             }
-            if (packet->th_flags != (TH_FIN | TH_ACK)) {
-                errno = ECONNREFUSED;
-                free(header);
-                free(packet);
-                free(ctx);
-                return;
+            else if(packet->th_flags == TH_ACK) {
+                ctx->connection_state = FIN_WAIT_2;
+
+                //wait for FIN-ACK packet from server
+                stcp_wait_for_event(sd, NETWORK_DATA, NULL);
+
+                if((numBytes = stcp_network_recv(sd, (void *)packet, sizeof(STCPHeader) + STCP_MSS)) < (ssize_t)sizeof(STCPHeader)) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
+                if (packet->th_flags != (TH_FIN | TH_ACK)) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
+                ctx->rcvd_seq = ntohl(packet->th_seq);
+                ctx->rcvd_ack = ntohl(packet->th_ack);
+                ctx->rcvd_win = ntohs(packet->th_win);
+                ctx->rcvd_len = numBytes - sizeof(STCPHeader);
+
+                ctx->connection_state = TIME_WAIT;
+
+                //notifiy FIN-ACK received
+                stcp_fin_received(sd);
+
+                //create ACK packet
+                header->th_seq = htonl(ctx->rcvd_ack);
+                header->th_ack = htonl(ctx->rcvd_seq + 1);
+                header->th_flags = TH_ACK;
+                header->th_off = sizeof(STCPHeader)/4;
+                header->th_win = htons(3072);
+
+                //send ACK packet to server
+                if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+                    errno = ECONNREFUSED;
+                    free(header);
+                    free(packet);
+                    free(ctx);
+                    return;
+                }
             }
-            ctx->rcvd_seq = ntohl(packet->th_seq);
-            ctx->rcvd_ack = ntohl(packet->th_ack);
-            ctx->rcvd_win = ntohs(packet->th_win);
-            ctx->rcvd_len = numBytes - sizeof(STCPHeader);
-
-            ctx->connection_state = TIME_WAIT;
-
-            //notifiy FIN-ACK received
-            stcp_fin_received(sd);
-
-            //create ACK packet
-            header->th_seq = htonl(ctx->rcvd_ack);
-            header->th_ack = htonl(ctx->rcvd_seq + 1);
-            header->th_flags = TH_ACK;
-            header->th_off = sizeof(STCPHeader)/4;
-            header->th_win = htons(3072);
-
-            //send ACK packet to server
-            if(stcp_network_send(sd, (void *)header, sizeof(STCPHeader), NULL) < 0) {
+            else {
                 errno = ECONNREFUSED;
                 free(header);
                 free(packet);
